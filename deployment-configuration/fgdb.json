@@ -1,0 +1,11 @@
+{
+    "serviceterritory": "D:\\connections\\common.sde\\COMMON.serviceterritory",
+    "datasetname": "UN",
+    "utilitynetworkname" :"Water",
+    "domainnetworks" :"Structure;Water",
+    "configurations" :"*",
+    "renamefield":"",
+    "loaddata": "INCLUDE_DATA",
+    "postprocess": "POST_PROCESS",
+    "version_fcs":[]
+}
