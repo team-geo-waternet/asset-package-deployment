@@ -1,0 +1,758 @@
+import arcpy, sys, os, json, getopt, untools, zipfile, traceback
+from datetime import datetime
+import xml.dom.minidom as md
+import xml.etree.ElementTree as ET
+UNCONFIG = 'unconfiguration'
+XMLWS = 'xmlworkspace'
+
+class Toolbox:
+    def __init__(self):
+        """Define the toolbox (the name of the toolbox is the name of the .pyt file)."""
+        self.label = "Toolbox"
+        self.alias = "toolbox"
+
+        # List of tool classes associated with this toolbox
+        self.tools = [ExportAssetPackage, ImportAssetPackage, DeployAssetPackage]
+
+class ImportAssetPackage:
+    def __init__(self):
+        """Define the tool (tool name is the name of the class)."""
+        self.label = "Import Asset Package"
+        self.description = ""
+
+    def getParameterInfo(self):
+        """Define the tool parameters."""
+        in_folder = arcpy.Parameter(
+            displayName="Input Folder",
+            name="in_folder",
+            datatype="DEFolder",
+            parameterType="Required",
+            direction="Input")
+        out_workdir = arcpy.Parameter(
+            displayName="Output Folder",
+            name="out_workdir",
+            datatype="DEFolder",
+            parameterType="Required",
+            direction="Input")
+        out_gdb = arcpy.Parameter(
+            displayName="Output Geodatabasename",
+            name="out_gdb",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input")
+        
+        return [in_folder,out_workdir,out_gdb]
+
+    def isLicensed(self):
+        """Set whether the tool is licensed to execute."""
+        return True
+
+    def updateParameters(self, parameters):
+        """Modify the values and properties of parameters before internal
+        validation is performed.  This method is called whenever a parameter
+        has been changed."""
+        return
+
+    def updateMessages(self, parameters):
+        """Modify the messages created by internal validation for each tool
+        parameter. This method is called after internal validation."""
+        return
+
+    def execute(self, parameters, messages):
+        """The source code of the tool."""
+        in_folder = parameters[0].valueAsText
+        out_workdir = parameters[1].valueAsText
+        out_gdb = parameters[2].valueAsText
+        #test if unconfiguration and xml workspace dir are present
+        unconfiguration = os.path.join(in_folder, UNCONFIG)
+        xmlworkspace = os.path.join(in_folder, XMLWS)
+        if not os.path.exists(unconfiguration):
+            arcpy.AddError("unconfiguration directory not found at {}".format(unconfiguration))
+            return
+        if not os.path.exists(xmlworkspace):
+            arcpy.AddError("xmlworkspace directory not found at {}".format(xmlworkspace))
+            return
+        #arcpy.env.workspace = in_gdb
+        out_file_gdb = self.importXMLworkspace(xmlworkspace, out_workdir, out_gdb)
+        arcpy.AddMessage(out_file_gdb)
+
+        self.importUtilityNetworkConfiguration(unconfiguration, out_file_gdb)
+        
+        return
+
+    def importUtilityNetworkConfiguration(self, unconfiguration, out_gdb):
+        """Loads the JSON data into the FGDB
+        """
+        arcpy.AddMessage("Start import of the un package data")
+        arcpy.AddMessage(str(type(out_gdb)))
+        arcpy.env.workspace = out_gdb
+        arcpy.AddMessage(arcpy.env.workspace)
+        
+        tbl_a = arcpy.ListTables("A_*")
+        arcpy.AddMessage(tbl_a)
+        tbl_b = arcpy.ListTables("B_*")
+        arcpy.AddMessage(tbl_b)
+        tbl_c = arcpy.ListTables("C_*")
+        arcpy.AddMessage(tbl_c)
+        tbl_d = arcpy.ListTables("D_*")
+        arcpy.AddMessage(tbl_d)
+
+        all_tables = tbl_a + tbl_b + tbl_c + tbl_d
+        for table in all_tables:
+            self.importTableData(out_gdb, table, unconfiguration)
+
+    def importTableData(self, gdb_path, table, folder):
+        """Loads the JSON data for a specific table into the FGDB
+        """
+        arcpy.AddMessage("Start import of table")
+        directory = os.path.join(folder,table)
+        in_json_file = os.path.join(directory,table + '.json')
+        out_features = os.path.join(gdb_path,table)
+        fields = arcpy.ListFields(out_features)
+        field_names  = ["OBJECTID"]
+        for field in fields:
+            if field.name != "OBJECTID":
+                field_names.append(field.name)
+        arcpy.AddMessage(field_names)
+        filename = table + ".json"
+        filepath = os.path.join(directory,filename )
+        features = []
+        try:
+            with open(filepath,'r',  encoding='utf8') as features_file:
+                features = json.load(features_file)
+        except:
+            arcpy.AddWarning( 'Error reading and loading {}'.format(filepath))
+        with arcpy.da.InsertCursor(out_features,field_names) as cursor:
+            for row in features['features']:
+                attributes = []
+                for field_name in field_names:
+                    if field_name in row['attributes']:
+                        #arcade expressions are stored in separate files instead of the geojson to improve readability of the arcade expressions
+                        #read the arcade expression file and append it into the attributes
+                        if field_name.lower().startswith("script_expression") and row['attributes'][field_name] is not None:
+                            filename_arc = row['attributes'][field_name]
+                            filepath_arc = os.path.join(directory,filename_arc)
+                            with open(filepath_arc, 'r', encoding='utf8') as arc_file:
+                                arcade_expression = arc_file.read()
+                                arcpy.AddMessage(filepath_arc)
+                                attributes.append(arcade_expression)
+                        #diagram blobs are stored in separate files instead of the geojson to improve version management on the individual network diagram files
+                        #read the adiagram file and append it into the attributes
+                        elif field_name.lower().endswith("_file") and row['attributes'][field_name] is not None:
+                            filename_file = row['attributes'][field_name]
+                            filepath_file = os.path.join(directory,filename_file)
+                            with open(filepath_file, 'rb') as fr:
+                                filebytes =  fr.read()
+                                arcpy.AddMessage(filepath_file)
+                                attributes.append(filebytes)
+                        else:
+                            attributes.append(row['attributes'][field_name])
+                    else:
+                        arcpy.AddWarning('Field {} not found in feature {}'.format(field_name, features_file))
+                        attributes.append(None)
+                cursor.insertRow(attributes)
+
+        arcpy.AddMessage("Imported to {}".format(table))
+
+                
+
+            
+    
+    def importXMLworkspace(self, directory, out_workdir, out_gdb):
+        """reconstructs the  XML workspace and  converts the XML workspace to a FGDB.
+        The XML is split on domain definitions and dataset definitions. Featuredatasets are also split into subdirectories and XML's
+        """
+        arcpy.AddMessage("Start import of the XML workspace")
+        in_file = os.path.join(directory, "workspace.xml")
+        out_file = os.path.join(out_workdir, "workspace.xml")
+        domainsdir = os.path.join(directory, 'domains')
+        datasetsdir = os.path.join(directory, 'datasets')
+        fgdb_path = os.path.join(out_workdir, out_gdb)
+
+        tree = ET.parse(in_file)
+        root = tree.getroot()
+        wsd = root.find('WorkspaceDefinition')
+        domains = wsd.find('Domains')
+        datasetdefs = wsd.find('DatasetDefinitions')
+        #read the subdirectory with domain xml files and append the xml files to the Domains XML tag in the main document
+        domainxmls = os.listdir(domainsdir)
+        for domainxml  in domainxmls:
+            domainxmltree = ET.parse(os.path.join(domainsdir,domainxml))
+            domainxmlroot = domainxmltree.getroot()
+            domains.append(domainxmlroot)
+        #read the subdirectory with dataset xml files and append the xml files to the DatasetDefinitions XML tag in the main document
+        datasetxmls = os.listdir(datasetsdir)
+        for datasetxml  in datasetxmls:
+            fsfile = os.path.join(datasetsdir,datasetxml)
+            if os.path.isfile(fsfile):
+                datasetxmltree = ET.parse(fsfile)
+                datasetxmlroot = datasetxmltree.getroot()
+                name_element = datasetxmlroot.find('Name')
+                name = name_element.text
+                datasettype = datasetxmlroot.get(r"{http://www.w3.org/2001/XMLSchema-instance}type")
+                arcpy.AddMessage(datasettype)
+                #read the subdirectory with dataset xml files for the Featuredataset and append the xml files to the Featuredataset Children XML tag
+                if datasettype == "esri:DEFeatureDataset":
+                    childrenelement = datasetxmlroot.find('Children')
+                    childdir = os.path.join(datasetsdir,name)
+                    fsdatasetxmls = os.listdir(childdir)
+                    for fsdatasetxml in  fsdatasetxmls:
+                        fdsfile = os.path.join(childdir,fsdatasetxml)
+                        if os.path.isfile(fdsfile):
+                            fdatasetxmltree = ET.parse(fdsfile)
+                            fdatasetxmlroot = fdatasetxmltree.getroot()
+                            childrenelement.append(fdatasetxmlroot)
+                datasetdefs.append(datasetxmlroot)
+        ET.register_namespace('esri',"http://www.esri.com/schemas/ArcGIS/10.8")
+        with open(out_file, 'wb') as f:
+            f.write(str.encode("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"))
+            f.write(ET.tostring(root, encoding='utf-8'))
+            arcpy.AddMessage(out_file)
+        
+        #test if the XML schema definitions are there and fix it when needed. This is done by simple string search and replace fuctions
+        with open(out_file, 'r', encoding='utf8') as f:
+            xmlstring = f.read()
+        if 'xmlns:xs="http://www.w3.org/2001/XMLSchema"' not in xmlstring:
+            arcpy.AddMessage("XMLSchema namespace not found, adding")
+            xmlstring= xmlstring.replace('xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"', 'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"  xmlns:xs="http://www.w3.org/2001/XMLSchema"')
+            if 'xmlns:xs="http://www.w3.org/2001/XMLSchema"' not in xmlstring:
+                arcpy.AddWarning("XMLSchema namespace still not found, check the string replace function")
+            with open(out_file, 'w', encoding='utf8') as f:
+                f.write(xmlstring)
+                arcpy.AddMessage("Updated the xml file {}".format(out_file))
+
+        if os.path.exists(fgdb_path):
+            arcpy.Delete_management(fgdb_path)
+            arcpy.AddMessage("Deleted:" + fgdb_path)
+        out_file_gdb = arcpy.management.CreateFileGDB(out_workdir, out_gdb)
+        import_type = 'SCHEMA_ONLY'
+        arcpy.management.ImportXMLWorkspaceDocument(out_file_gdb, out_file, import_type)
+        arcpy.AddMessage("The XML workspace has been imported")
+        return out_file_gdb.getOutput(0)
+
+    def postExecute(self, parameters):
+        """This method takes place after outputs are processed and
+        added to the display."""
+        return
+
+
+class ExportAssetPackage:
+    def __init__(self):
+        """Define the tool (tool name is the name of the class)."""
+        self.label = "Export Asset Package"
+        self.description = ""
+
+    def getParameterInfo(self):
+        """Define the tool parameters."""
+        full_export =arcpy.Parameter(
+            displayName="Full Export",
+            name="full_export",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input") 
+        in_gdb = arcpy.Parameter(
+            displayName="Input Geodatabase",
+            name="in_gdb",
+            datatype="DEWorkspace",
+            parameterType="Required",
+            direction="Input")
+        folder = arcpy.Parameter(
+            displayName="Output Folder",
+            name="in_folder",
+            datatype="DEFolder",
+            parameterType="Required",
+            direction="Input")
+        return [full_export,in_gdb,folder]
+
+    def isLicensed(self):
+        """Set whether the tool is licensed to execute."""
+        return True
+
+    def updateParameters(self, parameters):
+        """Modify the values and properties of parameters before internal
+        validation is performed.  This method is called whenever a parameter
+        has been changed."""
+        return
+
+    def updateMessages(self, parameters):
+        """Modify the messages created by internal validation for each tool
+        parameter. This method is called after internal validation."""
+        return
+
+    def execute(self, parameters, messages):
+        """The source code of the tool."""
+        full_export = parameters[0].value
+        in_gdb = parameters[1].value
+        gdb_path = parameters[1].valueAsText
+        folder = parameters[2].valueAsText
+        arcpy.env.workspace = in_gdb
+        if full_export:
+            self.exportXMLworkspace(in_gdb, folder)
+
+        self.exportUtilityNetworkConfiguration( gdb_path, folder)        
+        
+        return
+
+    def exportUtilityNetworkConfiguration(self, gdb_path, folder):
+        """Exports the tables of the FGDB to JSON
+        """
+        arcpy.AddMessage("Start export of the un package data")
+        directory = os.path.join(folder,UNCONFIG)
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+        
+        tbl_a = arcpy.ListTables("A_*")
+        tbl_b = arcpy.ListTables("B_*")
+        tbl_c = arcpy.ListTables("C_*")        
+        tbl_d = arcpy.ListTables("D_*")
+        all_tables = tbl_a + tbl_b + tbl_c + tbl_d
+        for table in all_tables:
+            self.exportTable(gdb_path,table,directory)
+
+    def exportTable(self, gdb_path, table, folder):
+        """Exports the records of the table to JSON, arcade expression files and diagram files
+        """
+        arcpy.AddMessage("Start export of table")
+        directory = os.path.join(folder,table)
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+        out_json_file = os.path.join(directory,table + '.json')
+        in_features = os.path.join(gdb_path,table)
+        fields = arcpy.ListFields(in_features)
+        field_names  = ["OBJECTID"]
+        for field in fields:
+            if field.name != "OBJECTID":
+                field_names.append(field.name)
+        arcpy.AddMessage(field_names)
+        filename = table + ".json"
+        filepath = os.path.join(directory,filename )
+        features = {"features" : []}
+        with arcpy.da.SearchCursor(in_features,field_names) as cursor:
+            for row in cursor:
+                f = {"attributes":{}}
+                for i in range(0,len(field_names)):
+                    #if the field contains an arcade expression, export the content of the field to a separate file in the same directory based on the object id
+                    #the filename is then stored in the geojson as a reference 
+                    if field_names[i].lower().startswith("script_expression") and row[i] is not None:
+                        filename_arc = str(row[0]) + "." + field_names[i] + ".arcade"
+                        filepath_arc = os.path.join(directory,filename_arc)
+                        with open(filepath_arc, 'w', encoding='utf8') as arc_file:
+                            arcade_expression = row[i]
+                            arcpy.AddMessage(str(type(arcade_expression)))
+                            arcpy.AddMessage(filepath_arc)
+                            arc_file.write(row[i])
+                            f["attributes"][field_names[i]] = filename_arc
+                    #if the field contains a file blob, export the content of the field to a separate file in the same directory based on the object id
+                    #the filename is then stored in the geojson as a reference 
+                    elif field_names[i].lower().endswith("_file") and row[i] is not None:
+                        filename_file = str(row[0]) + "." + field_names[i] + ".file"
+                        filepath_file = os.path.join(directory,filename_file)
+                        with open(filepath_file, 'wb') as fw:
+                            binaryRep = row[i]
+                            fw.write(binaryRep.tobytes()) 
+                        f["attributes"][field_names[i]] = filename_file
+                    else:
+                        f["attributes"][field_names[i]] = row[i]
+                features["features"].append(f)
+        with open(filepath, 'w', encoding='utf8') as fp:
+            json.dump(features, fp, indent=4, ensure_ascii=False)
+        arcpy.AddMessage("Exported to {}".format(filepath))
+
+                
+
+            
+    
+    def exportXMLworkspace(self, workspace, folder):
+        """Exports the datamodel to XML workspace and then splits the XML files to a logical structure to makte the GIT diff process more easy
+        """
+        arcpy.AddMessage("Start export of the XML workspace")
+        directory = os.path.join(folder,XMLWS)
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+        domainsdir = os.path.join(directory, 'domains')
+        if not os.path.exists(domainsdir):
+            os.makedirs(domainsdir)
+        datasetsdir = os.path.join(directory, 'datasets')
+        if not os.path.exists(datasetsdir):
+            os.makedirs(datasetsdir)
+        in_data = workspace
+        out_file_path = os.path.join(directory, "workspace.xml")
+        export_option = 'SCHEMA_ONLY'
+        storage_type = 'NORMALIZED'
+        export_metadata = 'NO_METADATA'
+        arcpy.management.ExportXMLWorkspaceDocument(in_data, out_file_path, export_option, storage_type, export_metadata)
+        tree = ET.parse(out_file_path)
+        ET.indent(tree, space='  ', level=0)
+        root = tree.getroot()
+
+        wsd = root.find('WorkspaceDefinition')
+        #the domains list from the xml workspace is split into separate files for each domain
+        domains = wsd.find('Domains')
+        removedomains = []
+        removedatasets = []
+        for domain in domains:
+            name_element = domain.find('DomainName')
+            name = name_element.text
+            filename = os.path.join(domainsdir, "{}.xml".format(name))
+            with open(filename, 'wb') as f:
+                f.write(str.encode("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"))
+                f.write(ET.tostring(domain, encoding='utf-8'))
+                arcpy.AddMessage(filename)
+            removedomains.append(domain)
+        for domain in removedomains:
+            domains.remove(domain)
+        #the DatasetDefinitions list from the xml workspace is split into separate files for each dataset
+        #when a featuredataset is encountered, this a subdirectory is created for the featuredataset and the featuresets in the 
+        #featuredataset are stored into separate files in this subdirectory
+        datasetdefs = wsd.find('DatasetDefinitions')
+        for dataelement in datasetdefs:
+            name_element = dataelement.find('Name')
+            name = name_element.text
+            arcpy.AddMessage(name)
+            datasettype = dataelement.get(r"{http://www.w3.org/2001/XMLSchema-instance}type")
+            arcpy.AddMessage(datasettype)
+            if datasettype == "esri:DEFeatureDataset":
+                children = dataelement.find("Children")
+                featuredatasetsdir = os.path.join(directory, 'datasets', name)
+                if not os.path.exists(featuredatasetsdir):
+                    os.makedirs(featuredatasetsdir)
+                removechilds = []
+                for child in children:
+                    name_element = child.find('Name')
+                    childname = name_element.text
+                    childfilename = os.path.join(featuredatasetsdir, "{}.xml".format(childname))
+                    with open(childfilename, 'wb') as f:
+                        f.write(str.encode("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"))
+                        f.write(ET.tostring(child, encoding='utf-8'))
+                        arcpy.AddMessage(childfilename)
+                    removechilds.append(child)
+                for child in removechilds:    
+                    children.remove(child)
+                arcpy.AddMessage("Processed children")
+            filename = os.path.join(datasetsdir, "{}.xml".format(name))
+            with open(filename, 'wb') as f:
+                f.write(str.encode("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"))
+                f.write(ET.tostring(dataelement, encoding='utf-8'))
+                arcpy.AddMessage(filename)
+            removedatasets.append(dataelement)
+        for dataelement in removedatasets:
+            datasetdefs.remove(dataelement)
+
+        
+        ET.register_namespace('esri',"http://www.esri.com/schemas/ArcGIS/10.8")
+        ET.register_namespace('xs',"http://www.w3.org/2001/XMLSchema")
+        
+        with open(out_file_path, 'wb') as f:
+            f.write(str.encode("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"))
+            f.write(ET.tostring(root, encoding='utf-8'))
+
+        arcpy.AddMessage("The XML workspace has been exported")
+
+    def postExecute(self, parameters):
+        """This method takes place after outputs are processed and
+        added to the display."""
+        return
+
+class DeployAssetPackage:
+    def __init__(self):
+        """Define the tool (tool name is the name of the class)."""
+        self.label = "Deploy Asset Package"
+        self.description = ""
+
+    def getParameterInfo(self):
+        """Define the tool parameters."""
+        asset_package =arcpy.Parameter(
+            displayName="Asset package",
+            name="geodatabase",
+            datatype="DEWorkspace",
+            parameterType="Required",
+            direction="Input") 
+        service_territory_feature_class = arcpy.Parameter(
+            displayName="Service Territory Feature Class",
+            name="service_territory_feature_class",
+            datatype="DEFeatureClass",
+            parameterType="Required",
+            direction="Input")
+        output_folder = arcpy.Parameter(
+            displayName="Output Folder File Geodatabase",
+            name="output_folder",
+            datatype="DEFolder",
+            parameterType="Optional",
+            direction="Input")
+        output_name = arcpy.Parameter(
+            displayName="Output Name File Geodatabase",
+            name="output_name",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input")
+        output_sde = arcpy.Parameter(
+            displayName="Output SDE file",
+            name="output_sde",
+            datatype="DEFile",
+            parameterType="Optional",
+            direction="Input")
+        dataset_name = arcpy.Parameter(
+            displayName="Dataset Name",
+            name="dataset_name",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input")
+        in_utility_network_name = arcpy.Parameter(
+            displayName="Utility network name",
+            name="in_utility_network_name",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input")
+        domain_networks = arcpy.Parameter(
+            displayName="Domain networks",
+            name="domain_networks",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input",
+            multiValue=True)
+        load_data = arcpy.Parameter(
+            displayName="Load Data",
+            name="load_data",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input")
+        load_data.filter.type = "ValueList"
+        load_data.filter.list = ['INCLUDE_DATA', 'SCHEMA_ONLY']
+            
+        post_process = arcpy.Parameter(
+            displayName="Post process",
+            name="post_process",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input")
+        post_process.filter.type = "ValueList"
+        post_process.filter.list = ['POST_PROCESS', 'NO_POST_PROCESS']
+        configurations = arcpy.Parameter(
+            displayName="Configurations",
+            name="configurations",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input")
+        rename_field = arcpy.Parameter(
+            displayName="Rename Field",
+            name="rename_field",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input")
+        portal = arcpy.Parameter(
+            displayName="PortalUrl",
+            name="portal",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input")
+        username = arcpy.Parameter(
+            displayName="Portal Username",
+            name="portalusername",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input")
+        password = arcpy.Parameter(
+            displayName="Portal Password",
+            name="password",
+            datatype="GPStringHidden",
+            parameterType="Optional",
+            direction="Input")        
+        version_fcs = arcpy.Parameter(
+            displayName="Version Featureclasses",
+            name="version_fcs",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input",
+            multiValue=True)
+        return [asset_package,service_territory_feature_class,output_folder,output_name,output_sde,dataset_name,in_utility_network_name,domain_networks,load_data,post_process,configurations,rename_field,portal,username,password,version_fcs]
+
+    def isLicensed(self):
+        """Set whether the tool is licensed to execute."""
+        return True
+
+    def updateParameters(self, parameters):
+        """Modify the values and properties of parameters before internal
+        validation is performed.  This method is called whenever a parameter
+        has been changed."""
+        return
+
+    def updateMessages(self, parameters):
+        """Modify the messages created by internal validation for each tool
+        parameter. This method is called after internal validation."""
+        return
+
+    def execute(self, parameters, messages):
+        """The source code of the tool."""
+        #untools.logger.setLevel("DEBUG")
+        asset_package                   = parameters[0].value
+        service_territory_feature_class = parameters[1].value
+        output_folder                   = parameters[2].valueAsText
+        output_name                     = parameters[3].value
+        output_sde                      = parameters[4].value
+        output_sde_str                  = parameters[4].valueAsText
+        dataset_name                    = parameters[5].value
+        in_utility_network_name         = parameters[6].value
+        domain_networks                 = parameters[7].value
+        load_data                       = parameters[8].value
+        post_process                    = parameters[9].value
+        configurations                  = parameters[10].value
+        if configurations is None:
+            configurations = "*"
+            arcpy.AddMessage("Set configurations to *")
+        rename_field                    = parameters[11].value
+        if rename_field is None:
+            rename_field = ""
+            arcpy.AddMessage("Set rename_field to ''")
+        portalurl                       = parameters[12].value
+        username                        = parameters[13].value
+        password                        = parameters[14].value
+        database = None
+        arcpy.AddMessage("Set portalurl: {}".format(portalurl))
+        arcpy.AddMessage("Set username: {}".format(username))
+        arcpy.AddMessage("Set output folder: {}".format(output_folder))
+        arcpy.AddMessage("Set output name: {}".format(output_name))
+        arcpy.AddMessage("Set output sde: {}".format(output_sde))
+        if output_folder is not None and output_name is not None:
+            arcpy.AddMessage("Create FGDB")
+            result = result = arcpy.management.CreateFileGDB(output_folder, output_name)
+            database = result.getOutput(0)
+            self.printResult(result)
+            arcpy.AddMessage("FGDB Created")
+        elif output_sde is not None:
+            database = output_sde
+            arcpy.env.workspace = database
+            database = arcpy.env.workspace
+            arcpy.SignInToPortal(portal_url=portalurl, username=username, password=password)
+        else:
+            arcpy.AddError("FGDB and EGDB not specified")
+            return False
+        arcpy.AddMessage("StageUtilityNetwork")
+        result = arcpy.pt.StageUtilityNetwork(database, service_territory_feature_class, dataset_name, in_utility_network_name)
+        self.printResult(result)
+        in_utility_network = os.path.join(database,dataset_name,in_utility_network_name)
+        arcpy.AddMessage("AssetPackageToUtilityNetwork")
+        arcpy.AddMessage(asset_package)
+        arcpy.AddMessage(in_utility_network)
+        arcpy.AddMessage(domain_networks)
+        arcpy.AddMessage(load_data)
+        arcpy.AddMessage(configurations)
+        arcpy.AddMessage(rename_field)
+        arcpy.AddMessage(post_process)
+        # POST_PROCESS is only applied to FGDB, when deploying to egdb rcpy.un.EnableNetworkTopology has to be used to get topology
+        result = arcpy.pt.AssetPackageToUtilityNetwork(asset_package=asset_package, in_utility_network=in_utility_network, domain_networks=domain_networks, load_data=load_data, analyze="ANALYZE", configurations=configurations, rename_field=rename_field, post_process=post_process)
+        self.printResult(result)
+        #this will upload the result fgdb to the portal to make it available for testing purposes. 
+        if portalurl is not None and username is not None and password is not None and output_folder is not None and output_name is not None:
+            from arcgis import GIS
+            gis = GIS(url=portalurl, username=username, password=password, use_gen_token=True)
+            arcpy.AddMessage(gis)
+            dt = datetime.now()
+            ts = str(int(datetime.timestamp(dt)))
+            result  = self.createzip(database, database.replace(".gdb",  ts+  ".gdb.zip"))
+            meta = {"title": "UN Geodatabase " + str(dt), "type": "File Geodatabase"}
+            addresult = gis.content.add(meta, result)
+            arcpy.AddMessage(addresult)
+        elif portalurl is not None and username is not None and password is None:
+            arcpy.AddWarning("Portal url and username found, but no password specified")
+        #when a output_sde is available, it's on the enterprise geodatabase and the featuredatasets, featureclasses and tables can be post processed
+        #this is partially just a check because the previous steps already enabled parts of the functions, 
+        #but for related tables and featureclasses outside of the utility network, this might not be applied yet and the postprcess will take care of this
+        if output_sde is not None:
+            dataset = os.path.join(output_sde_str,dataset_name)
+            self.postprocess_fc(dataset)    
+            version_fcs = parameters[15].valueAsText
+            user = self.getschemaowner()
+            try:
+                if version_fcs is not None:
+                    if not isinstance(version_fcs, list):
+                        if ',' in version_fcs:
+                            version_fcs = version_fcs.split(",")
+                        elif ";" in version_fcs:
+                            version_fcs = version_fcs.split(";")
+                    arcpy.AddMessage(version_fcs)
+                    for version_fc in version_fcs: 
+                        dataset = os.path.join(output_sde_str,"{}.{}".format(user,version_fc))
+                        arcpy.AddMessage("Post processing {}".format(dataset))
+                        self.postprocess_fc(dataset)
+            except Exception as e:
+                arcpy.AddMessage(traceback.format_exc())
+                print(traceback.format_exc())
+            result = arcpy.un.EnableNetworkTopology(in_utility_network=in_utility_network, max_number_of_errors=1000000, only_generate_errors="ENABLE_TOPO")
+            self.printResult(result)
+        
+        return True
+
+    def printResult(self, result):
+        messages = result.getAllMessages()
+        for message in messages:
+            arcpy.AddMessage(message[2])
+
+    def getschemaowner(self):
+        desc = arcpy.Describe(arcpy.env.workspace)
+        arcpy.AddMessage("connected user {}".format(desc.connectionProperties.user))
+        return desc.connectionProperties.user
+    
+    
+    def postprocess_fc(self,dataset ):
+        """Make sure a featuredataset, featureclass or table is ready for the utility network or related functions. globalids, editortracking, replicatracking and versioning are required. Do this with a branch versioned egdb sde connection file"""
+        try:
+            desc = arcpy.Describe(dataset)
+            hasGlobalID = False
+            try:
+                hasGlobalID = desc.hasGlobalID
+            except:
+                pass
+            if not hasGlobalID:
+                result = arcpy.management.AddGlobalIDs(in_datasets=dataset)
+                self.printResult(result)
+            else:
+                arcpy.AddMessage("Globalid already configured on Dataset {} ".format(dataset))
+            editorTrackingEnabled = False
+            try:
+                editorTrackingEnabled = desc.editorTrackingEnabled
+            except:
+                pass
+            if not editorTrackingEnabled:
+                result = arcpy.management.EnableEditorTracking(in_dataset=dataset, creator_field="created_user", creation_date_field="created_date", last_editor_field="last_edited_user", last_edit_date_field="last_edited_date", add_fields="ADD_FIELDS", record_dates_in="UTC")
+                self.printResult(result)
+            else:
+                arcpy.AddMessage("Editortracking already configured on Dataset {} ".format(dataset))
+            
+            isVersioned = False
+            try:
+                isVersioned = desc.isVersioned
+            except:
+                pass
+            if not isVersioned:
+                result = arcpy.management.RegisterAsVersioned(in_dataset=dataset,edit_to_base="NO_EDITS_TO_BASE")
+                self.printResult(result)
+            else:
+                arcpy.AddMessage("Versioning already configured on Dataset {} ".format(dataset))
+            #you cannot check replica tracking on a Describe object, so it is assumed its not configured yet and it is configured here
+            arcpy.AddMessage("Configuring replica tracking on".format(dataset))
+            result = arcpy.management.EnableReplicaTracking(in_dataset=dataset)
+            self.printResult(result)
+        except Exception as e:
+            arcpy.AddMessage(traceback.format_exc())
+            print(traceback.format_exc())
+
+    def createzip(self,source, destination):
+        """Creates a zipfile of the specified source and writes it to the specified destination"""    
+        relroot = source
+        with zipfile.ZipFile(destination, 'w') as zfile:
+            for root, dirs, files in os.walk(source):
+            # add directory (needed for empty dirs)
+                for file in files:
+                    filename = os.path.join(root, file)
+                    if os.path.isfile(filename) and destination != filename:  # regular files only
+                        if '.git' not in filename:
+                            arcname = os.path.join(os.path.relpath(root, relroot), file)
+                            zfile.write(filename, arcname)
+
+        print("Create Zipfile: {} from {} ".format(destination, source))
+        return destination
+    
+    def postExecute(self, parameters):
+        """This method takes place after outputs are processed and
+        added to the display."""
+        return
