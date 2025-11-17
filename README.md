@@ -70,7 +70,7 @@ To automate the deployment you'll need:
 - A build server installed with the agent connected to your platform (Azure Devops, Github or Gitlab). See the documentation of your development platform for more documentation
 - An ArcGIS Server installation, when publishing to EGDB, the server should be able to access the database. The script has a dependency on ArcPy and the ArcGIS Server provides this Python module and the required license
 - A custom Python ENV with Esri UN-Tools installed, see https://links.esri.com/solutions/UtilityNetworkPackageTools and https://anaconda.org/Esri/untools
-- A process to load the existing asset data into the FGDB before you deploy it. You could use FME or you're own Python code to do this
+- A process to load the existing asset data into the FGDB before you deploy it. You could use FME or your own Python code to do this
 
 ```mermaid
 graph LR
